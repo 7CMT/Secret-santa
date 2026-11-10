@@ -1,0 +1,67 @@
+name: Sync seen
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-seen
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record who has seen their draw
+        env:
+          TOPIC: santa2026-da2a20c8a1604390c800b0863f20a8
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth=1 origin data
+            git checkout -q -B data FETCH_HEAD
+          else
+            git checkout -q --orphan data
+            git rm -rf -q . || true
+          fi
+          python3 - <<'PY'
+          import json, os, urllib.request
+          suffix = " a vu son tirage"
+          seen = {}
+          if os.path.exists("seen.json"):
+              try:
+                  seen = json.load(open("seen.json", encoding="utf-8"))
+              except Exception:
+                  seen = {}
+          changed = not os.path.exists("seen.json")
+          try:
+              url = "https://ntfy.sh/" + os.environ["TOPIC"] + "/json?poll=1"
+              text = urllib.request.urlopen(url, timeout=30).read().decode("utf-8")
+              for line in text.splitlines():
+                  try:
+                      m = json.loads(line)
+                  except Exception:
+                      continue
+                  msg = m.get("message", "")
+                  if m.get("event") == "message" and msg.endswith(suffix):
+                      name = msg[:-len(suffix)]
+                      if name and name not in seen:
+                          seen[name] = m.get("time", 0)
+                          changed = True
+          except Exception as e:
+              print("ntfy unavailable:", e)
+          if changed:
+              with open("seen.json", "w", encoding="utf-8") as f:
+                  json.dump(seen, f, ensure_ascii=False, indent=1, sort_keys=True)
+          PY
+          git add seen.json 2>/dev/null || true
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -q -m "Update seen list"
+            git push -q origin data
+          fi
