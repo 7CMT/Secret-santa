@@ -224,6 +224,7 @@ footer { display: flex; justify-content: center; }
   var seen = {}, afilter = 'all', seenKey = 'santa-seen-' + D.admin.c.slice(0, 16);
   var NTFY = D.ntfy || null, notifKey = 'santa-notified-' + D.admin.c.slice(0, 16), syncTimer = null;
   var SUFFIX = ' a vu son tirage';
+  var ignored = {}, ignKey = 'santa-ignored-' + D.admin.c.slice(0, 16);
 
   function showOnly(id) {
     PANELS.forEach(function (x) { $(x).hidden = (x !== id); });
@@ -242,7 +243,21 @@ footer { display: flex; justify-content: center; }
     } catch (e) { seen = {}; }
   }
   function saveSeen() { try { localStorage.setItem(seenKey, JSON.stringify(seen)); } catch (e) {} }
-  function markSeen(name) { loadSeen(); seen[name] = 1; saveSeen(); seen = {}; }
+  function loadIgnored() {
+    try { var s = JSON.parse(localStorage.getItem(ignKey) || '{}'); ignored = (s && typeof s === 'object') ? s : {}; }
+    catch (e) { ignored = {}; }
+  }
+  function saveIgnored() { try { localStorage.setItem(ignKey, JSON.stringify(ignored)); } catch (e) {} }
+  function markSeen(name) {
+    loadSeen(); loadIgnored(); seen[name] = 1; delete ignored[name]; saveSeen(); saveIgnored(); seen = {}; ignored = {};
+  }
+  function seenUrl() {
+    if (D.seenUrl) return D.seenUrl;
+    var m = location.hostname.match(/^([^.]+)\.github\.io$/i), repo = location.pathname.split('/')[1];
+    if (!m || !repo || /\./.test(repo)) return null;
+    return 'https://raw.githubusercontent.com/' + m[1] + '/' + repo + '/data/seen.json';
+  }
+  function canSync() { return !!(NTFY || seenUrl()); }
   function notifySeen(name) {
     if (!NTFY || !window.fetch) return;
     var done = {};
@@ -254,27 +269,47 @@ footer { display: flex; justify-content: center; }
         .catch(function () {});
     } catch (e) {}
   }
-  async function syncSeen() {
-    if (!NTFY || !adminRows) return;
-    try {
-      var res = await fetch(NTFY.server + '/' + NTFY.topic + '/json?poll=1');
-      if (!res.ok) throw new Error('http');
-      var text = await res.text(), known = {}, added = 0;
-      adminRows.forEach(function (r) { known[r[0]] = 1; });
-      text.split('\n').forEach(function (line) {
-        if (!line.trim()) return;
-        var m; try { m = JSON.parse(line); } catch (e) { return; }
-        if (m.event !== 'message' || typeof m.message !== 'string') return;
-        if (m.message.slice(-SUFFIX.length) !== SUFFIX) return;
-        var n = m.message.slice(0, -SUFFIX.length);
-        if (known[n] && !seen[n]) { seen[n] = 1; added++; }
-      });
-      if (added) { saveSeen(); renderAdmin(); }
-      var hh = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-      $('async').textContent = 'Synchronisé avec ntfy à ' + hh + (added ? ' : ' + added + (added > 1 ? ' nouveaux.' : ' nouveau.') : '.');
-    } catch (e) {
-      $('async').textContent = 'Synchronisation indisponible. Les notifications de l\'application ntfy restent la référence.';
+  async function fetchNames() {
+    var names = [], ok = false, url = seenUrl();
+    if (url) {
+      try {
+        var r1 = await fetch(url + '?t=' + Date.now(), { cache: 'no-store' });
+        if (r1.ok) { names = names.concat(Object.keys((await r1.json()) || {})); ok = true; }
+      } catch (e) {}
     }
+    if (NTFY) {
+      try {
+        var r2 = await fetch(NTFY.server + '/' + NTFY.topic + '/json?poll=1');
+        if (r2.ok) {
+          (await r2.text()).split('\n').forEach(function (line) {
+            if (!line.trim()) return;
+            var m; try { m = JSON.parse(line); } catch (e) { return; }
+            if (m.event === 'message' && typeof m.message === 'string' && m.message.slice(-SUFFIX.length) === SUFFIX) {
+              names.push(m.message.slice(0, -SUFFIX.length));
+            }
+          });
+          ok = true;
+        }
+      } catch (e) {}
+    }
+    return ok ? names : null;
+  }
+  async function syncSeen() {
+    if (!adminRows || !canSync()) return;
+    var names = await fetchNames();
+    if (!adminRows) return;
+    if (!names) {
+      $('async').textContent = 'Synchronisation indisponible pour le moment. Les notifications de l\'application ntfy restent la référence.';
+      return;
+    }
+    var known = {}, added = 0;
+    adminRows.forEach(function (r) { known[r[0]] = 1; });
+    names.forEach(function (n) {
+      if (known[n] && !seen[n] && !ignored[n]) { seen[n] = 1; added++; }
+    });
+    if (added) { saveSeen(); renderAdmin(); }
+    var hh = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    $('async').textContent = 'Synchronisé à ' + hh + (added ? ' : ' + added + (added > 1 ? ' nouveaux.' : ' nouveau.') : '.');
   }
 
   async function open_(o, code, aad, iter) {
@@ -339,7 +374,7 @@ footer { display: flex; justify-content: center; }
 
   function reset() {
     clearTimeout(timer); clearInterval(syncTimer);
-    current = null; adminRows = null; seen = {}; afilter = 'all'; $('async').textContent = '';
+    current = null; adminRows = null; seen = {}; ignored = {}; afilter = 'all'; $('async').textContent = '';
     $('r-from').textContent = ''; $('r-to').textContent = '';
     $('code').value = ''; $('err').textContent = '';
     $('acode').value = ''; $('aerr').textContent = '';
@@ -431,8 +466,8 @@ footer { display: flex; justify-content: center; }
   $('alist').addEventListener('click', function (e) {
     var b = e.target.closest('button.arow'); if (!b || !adminRows) return;
     var n = b.dataset.n;
-    if (seen[n]) delete seen[n]; else seen[n] = 1;
-    saveSeen(); renderAdmin();
+    if (seen[n]) { delete seen[n]; ignored[n] = 1; } else { seen[n] = 1; delete ignored[n]; }
+    saveSeen(); saveIgnored(); renderAdmin();
   });
   document.querySelectorAll('button.chip').forEach(function (c) {
     c.addEventListener('click', function () {
@@ -458,7 +493,7 @@ footer { display: flex; justify-content: center; }
       var txt = await open_(D.admin, code, 'admin', D.aiter);
       adminLimit.ok();
       adminRows = JSON.parse(txt);
-      loadSeen();
+      loadSeen(); loadIgnored();
       afilter = 'all';
       document.querySelectorAll('button.chip').forEach(function (x) {
         x.setAttribute('aria-pressed', x.dataset.f === 'all' ? 'true' : 'false');
@@ -467,12 +502,12 @@ footer { display: flex; justify-content: center; }
       $('ago').disabled = false;
       $('aq').value = ''; $('acopy-msg').textContent = '';
       renderAdmin();
-      $('ahelp').textContent = NTFY
-        ? 'Les tirages vus se marquent tout seuls grâce aux notifications ntfy. Vous pouvez aussi toucher une ligne pour la marquer à la main. Le suivi est enregistré sur cet appareil.'
+      $('ahelp').textContent = canSync()
+        ? 'Les tirages vus se marquent tout seuls. Vous pouvez aussi toucher une ligne pour la marquer ou la démarquer à la main. Une ligne démarquée n\'est plus recolorée sur cet appareil.'
         : 'Les tirages ouverts sur cet appareil se marquent tout seuls. Pour les autres, touchez une ligne pour la marquer « a vu son tirage ». Le suivi reste enregistré sur cet appareil.';
-      $('asyncbtn').hidden = !NTFY;
+      $('asyncbtn').hidden = !canSync();
       clearInterval(syncTimer);
-      if (NTFY) { syncSeen(); syncTimer = setInterval(syncSeen, 30000); }
+      if (canSync()) { syncSeen(); syncTimer = setInterval(syncSeen, 30000); }
       showOnly('step-adminlist');
       clearTimeout(timer); timer = setTimeout(reset, 300000);
       window.scrollTo(0, 0);
